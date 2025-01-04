@@ -1,0 +1,8 @@
+functions-framework
+flask
+yt-dlp
+openai-whisper
+torch
+requests
+python-dotenv
+colorama

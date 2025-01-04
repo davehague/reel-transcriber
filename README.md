@@ -59,15 +59,33 @@ Command line options:
 - `--temp-dir PATH`: Specify directory for temporary files
 
 ### Google Cloud Function
+The transcriber is also available as a Google Cloud Function. 
 
-The transcriber is also available as a Google Cloud Function. Deploy using:
+Create deployment directory:
 
-1. Create new Cloud Function in Google Cloud Console
-2. Set runtime to Python 3.11+
-3. Set entry point to "transcribe_reel"
-4. Upload the code from src/cloud/main.py
-5. Deploy
+```bash
+mkdir deploy
 
+cp src/cloud/main.py deploy/
+cp src/core/* deploy/
+cp requirements.txt deploy/
+```
+
+Deploy using gcloud CLI:
+
+```bash
+cd deploy
+gcloud functions deploy transcribe-reel \
+    --gen2 \
+    --runtime python311 \
+    --source . \
+    --entry-point=transcribe_reel \
+    --trigger-http \
+    --allow-unauthenticated \
+    --memory 1024mb \
+    --timeout=180
+``` 
+   
 Call the function with:
 ```javascript
 fetch('FUNCTION_URL', {
