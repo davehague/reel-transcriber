@@ -1,8 +1,8 @@
-functions-framework
-flask
-yt-dlp
-openai-whisper
-torch
+functions-framework==3.*
+flask==2.*
+yt-dlp==2023.11.16
 requests
 python-dotenv
-colorama
+google-cloud-speech
+google-cloud-storage
+ffmpeg-python

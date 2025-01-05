@@ -59,18 +59,18 @@ Command line options:
 - `--temp-dir PATH`: Specify directory for temporary files
 
 ### Google Cloud Function
-The transcriber is also available as a Google Cloud Function. 
+The transcriber is also available as a Google Cloud Function.  Make sure the gcloud CLI is installed, then follow these steps:
 
-Create deployment directory:
-
-```bash
-mkdir deploy
-
-cp src/cloud/main.py deploy/
-cp src/core/* deploy/
-cp requirements.txt deploy/
+#### List available projects
+```commandline
+gcloud projects list
 ```
 
+#### Configure google cloud bucket
+```commandline
+gcloud storage buckets create gs://<your-project-id>-transcribe-reels
+```
+   
 Deploy using gcloud CLI:
 
 ```bash
@@ -85,21 +85,14 @@ gcloud functions deploy transcribe-reel \
     --memory 1024mb \
     --timeout=180
 ``` 
-   
-Call the function with:
-```javascript
-fetch('FUNCTION_URL', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  body: JSON.stringify({
-    url: 'INSTAGRAM_URL',
-    upload_to_readwise: true,  // optional
-    readwise_token: 'TOKEN'    // required if upload_to_readwise is true
-  })
-});
+
+#### Test the function
+Use the script in `scripts/test.js`
+
+```bash
+node scripts/test.js
 ```
+
 
 ## Requirements
 
