@@ -10,6 +10,7 @@ from google.cloud import speech_v1
 from google.cloud import storage
 import uuid
 import time
+from openai import OpenAI
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,11 +36,17 @@ class YDLLogger:
 
 class InstagramTranscriber:
     def __init__(self):
+        # Google Speech-to-Text clients
         self.speech_client = speech_v1.SpeechClient()
         self.storage_client = storage.Client()
         self.bucket_name = os.environ.get('GCP_STORAGE_BUCKET')
+
+        # OpenAI client (initialize only if API key is present)
+        self.openai_client = OpenAI() if os.environ.get('OPENAI_API_KEY') else None
+
+        # Instagram credentials
         self.instagram_username = os.environ.get('INSTAGRAM_USERNAME')
-        self.instagram_password = os.environ.get('INSTAGRAM_PASSWORD')  # You'll need to set this
+        self.instagram_password = os.environ.get('INSTAGRAM_PASSWORD')
 
     def normalize_instagram_url(self, url: str) -> str:
         """Convert various Instagram URL formats to the standard format."""
@@ -111,7 +118,6 @@ class InstagramTranscriber:
             logger.error(f"Error during download: {str(e)}", exc_info=True)
             raise
 
-
     def get_instagram_cookies(self) -> Dict:
         """Get cookies needed for Instagram authentication."""
         session = requests.Session()
@@ -141,7 +147,6 @@ class InstagramTranscriber:
 
         return session.cookies.get_dict()
 
-
     def upload_to_gcs(self, local_path: str) -> str:
         logger.info(f"Preparing to upload file from {local_path}")
         if not os.path.exists(local_path):
@@ -159,57 +164,31 @@ class InstagramTranscriber:
 
         return f"gs://{self.bucket_name}/{blob_name}"
 
-    def transcribe(self, url: str, temp_dir: Optional[str] = None) -> Dict:
-        """
-        Transcribe an Instagram video/reel.
+    def transcribe_with_whisper(self, actual_file: str) -> str:
+        """Transcribe audio using OpenAI's Whisper API."""
+        if not self.openai_client:
+            raise ValueError("OpenAI API key not set in environment variables")
 
-        Args:
-            url (str): The Instagram video/reel URL to transcribe
-            temp_dir (Optional[str]): Directory for temporary files. Defaults to /tmp
+        logger.info("Starting Whisper transcription")
+        with open(actual_file, "rb") as audio_file:
+            transcript = self.openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+        logger.info("Whisper transcription completed")
+        return transcript
 
-        Returns:
-            Dict: Contains transcript text, title, author, and source URL
-
-        Raises:
-            ValueError: If GCP_STORAGE_BUCKET environment variable is not set
-            FileNotFoundError: If downloaded audio file cannot be found
-        """
-        logger.info(f"Starting transcription for URL: {url}")
-
+    def transcribe_with_google(self, actual_file: str) -> str:
+        """Transcribe audio using Google Speech-to-Text."""
         if not self.bucket_name:
             raise ValueError("GCP_STORAGE_BUCKET environment variable not set")
 
-        info = self.get_video_info(url)
-        logger.info(f"Video info: {info}")
-
-        temp_dir = temp_dir or '/tmp'
-        base_temp_file = os.path.join(temp_dir, 'temp_audio')  # Base filename without extension
+        logger.info("Uploading to GCS")
+        gcs_uri = self.upload_to_gcs(actual_file)
+        logger.info(f"Uploaded to GCS: {gcs_uri}")
 
         try:
-            logger.info(f"Attempting to download video from {url}")
-            self.download_video(url, base_temp_file)
-            logger.info(f"Video downloaded to {base_temp_file}")
-
-            # Look for the actual file with extension
-            actual_file = None
-            for ext in ['.mp3', '.m4a', '.wav']:  # Common audio extensions
-                potential_file = base_temp_file + ext
-                if os.path.exists(potential_file):
-                    actual_file = potential_file
-                    logger.info(f"Found audio file: {potential_file}")
-                    break
-
-            if not actual_file:
-                logger.error(f"No audio file found in {temp_dir}")
-                logger.info(f"Directory contents: {os.listdir(temp_dir)}")
-                raise FileNotFoundError(f"No audio file found with base name {base_temp_file}")
-
-            logger.info(f"Found audio file: {actual_file}")
-
-            logger.info("Uploading to GCS")
-            gcs_uri = self.upload_to_gcs(actual_file)
-            logger.info(f"Uploaded to GCS: {gcs_uri}")
-
             # Configure the transcription request
             audio = speech_v1.RecognitionAudio(uri=gcs_uri)
             config = speech_v1.RecognitionConfig(
@@ -228,17 +207,63 @@ class InstagramTranscriber:
             logger.info("Transcription completed")
 
             # Combine all transcriptions
-            transcript_text = " ".join(
+            return " ".join(
                 result.alternatives[0].transcript
                 for result in response.results
             )
-
+        finally:
             # Clean up GCS
             logger.info("Cleaning up GCS bucket")
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob(gcs_uri.replace(f"gs://{self.bucket_name}/", ""))
             blob.delete()
             logger.info("GCS cleanup completed")
+
+    def transcribe(self, url: str, temp_dir: Optional[str] = None, use_whisper: bool = True) -> Dict:
+        """
+        Transcribe an Instagram video/reel using either OpenAI's Whisper or Google Speech-to-Text.
+
+        Args:
+            url (str): The Instagram video/reel URL to transcribe
+            temp_dir (Optional[str]): Directory for temporary files. Defaults to /tmp
+            use_whisper (bool): If True, use OpenAI's Whisper API; if False, use Google Speech-to-Text
+
+        Returns:
+            Dict: Contains transcript text, title, author, and source URL
+        """
+        logger.info(f"Starting transcription for URL: {url}")
+
+        info = self.get_video_info(url)
+        logger.info(f"Video info: {info}")
+
+        temp_dir = temp_dir or '/tmp'
+        base_temp_file = os.path.join(temp_dir, 'temp_audio')
+
+        try:
+            logger.info(f"Attempting to download video from {url}")
+            self.download_video(url, base_temp_file)
+            logger.info(f"Video downloaded to {base_temp_file}")
+
+            # Look for the actual file with extension
+            actual_file = None
+            for ext in ['.mp3', '.m4a', '.wav']:
+                potential_file = base_temp_file + ext
+                if os.path.exists(potential_file):
+                    actual_file = potential_file
+                    logger.info(f"Found audio file: {potential_file}")
+                    break
+
+            if not actual_file:
+                logger.error(f"No audio file found in {temp_dir}")
+                logger.info(f"Directory contents: {os.listdir(temp_dir)}")
+                raise FileNotFoundError(f"No audio file found with base name {base_temp_file}")
+
+            # Choose transcription method
+            transcript_text = (
+                self.transcribe_with_whisper(actual_file)
+                if use_whisper else
+                self.transcribe_with_google(actual_file)
+            )
 
             return {
                 'transcript': f"{str(transcript_text)}\n\nSource: {url}",
@@ -264,7 +289,6 @@ class InstagramTranscriber:
                         logger.warning(f"Failed to clean up {file_path}: {str(e)}")
 
 
-# ReadwiseUploader class remains unchanged
 class ReadwiseUploader:
     def __init__(self, token: str):
         self.token = token
@@ -333,9 +357,10 @@ def transcribe_reel(request):
         url = request_json['url']
         upload_to_readwise = request_json.get('upload_to_readwise', False)
         readwise_token = request_json.get('readwise_token')
+        use_whisper = request_json.get('use_whisper', True)  # Default to Whisper
 
         transcriber = InstagramTranscriber()
-        result = transcriber.transcribe(url, '/tmp')
+        result = transcriber.transcribe(url, '/tmp', use_whisper=use_whisper)
 
         if upload_to_readwise:
             if not readwise_token:
