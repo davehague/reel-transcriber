@@ -61,6 +61,13 @@ Command line options:
 ### Google Cloud Function
 The transcriber is also available as a Google Cloud Function.  Make sure the gcloud CLI is installed, then follow these steps:
 
+#### Set up your environment yaml
+```commandline
+GCP_STORAGE_BUCKET: "your-bucket"
+INSTAGRAM_USERNAME: "your-username"
+INSTAGRAM_PASSWORD: "your-password"
+```
+
 #### List available projects
 ```commandline
 gcloud projects list

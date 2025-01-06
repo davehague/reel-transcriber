@@ -9,6 +9,7 @@ import logging
 from google.cloud import speech_v1
 from google.cloud import storage
 import uuid
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +37,9 @@ class InstagramTranscriber:
     def __init__(self):
         self.speech_client = speech_v1.SpeechClient()
         self.storage_client = storage.Client()
-        self.bucket_name = os.environ.get('GCP_STORAGE_BUCKET')  # You'll need to set this
+        self.bucket_name = os.environ.get('GCP_STORAGE_BUCKET')
+        self.instagram_username = os.environ.get('INSTAGRAM_USERNAME')
+        self.instagram_password = os.environ.get('INSTAGRAM_PASSWORD')  # You'll need to set this
 
     def normalize_instagram_url(self, url: str) -> str:
         """Convert various Instagram URL formats to the standard format."""
@@ -49,13 +52,18 @@ class InstagramTranscriber:
         url = self.normalize_instagram_url(url)
         logger.info(f"Normalized URL: {url}")
 
+        cookies = self.get_instagram_cookies()
+
         ydl_opts = {
             'skip_download': True,
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
             'encoding': None,
-            'logger': YDLLogger()
+            'logger': YDLLogger(),
+            'cookiefile': None,
+            'cookiesfrombrowser': None,
+            'cookies': cookies  # Use the cookies directly
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -71,6 +79,10 @@ class InstagramTranscriber:
     def download_video(self, url: str, output_path: str) -> None:
         url = self.normalize_instagram_url(url)
         logger.info(f"Starting download with output path: {output_path} for URL: {url}")
+
+        cookies = self.get_instagram_cookies()
+        logger.info("Got Instagram cookies")
+
         ydl_opts = {
             'outtmpl': output_path,
             'format': 'bestaudio/best',
@@ -79,9 +91,11 @@ class InstagramTranscriber:
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'encoding': None,  # Let yt-dlp handle encoding
+            'encoding': None,
             'logger': YDLLogger(),
-            'progress_hooks': []
+            'progress_hooks': [
+                lambda d: logger.info(f"Download progress: {d.get('status')} - {d.get('filename', 'unknown file')}")],
+            'cookies': cookies
         }
 
         try:
@@ -89,11 +103,44 @@ class InstagramTranscriber:
                 logger.info("Starting yt-dlp download")
                 ydl.download([url])
                 logger.info("yt-dlp download completed")
+
+                # List directory contents after download
+                dir_path = os.path.dirname(output_path)
+                logger.info(f"Directory contents after download: {os.listdir(dir_path)}")
         except Exception as e:
             logger.error(f"Error during download: {str(e)}", exc_info=True)
             raise
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+
+
+    def get_instagram_cookies(self) -> Dict:
+        """Get cookies needed for Instagram authentication."""
+        session = requests.Session()
+        # First request to get the csrftoken
+        session.get('https://www.instagram.com/accounts/login/')
+        cookies = session.cookies.get_dict()
+
+        # Login request
+        login_data = {
+            'username': self.instagram_username,
+            'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{self.instagram_password}',
+            'queryParams': {},
+            'optIntoOneTap': 'false'
+        }
+
+        login_headers = {
+            'X-CSRFToken': cookies.get('csrftoken', ''),
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://www.instagram.com/accounts/login/'
+        }
+
+        session.post(
+            'https://www.instagram.com/accounts/login/ajax/',
+            data=login_data,
+            headers=login_headers
+        )
+
+        return session.cookies.get_dict()
+
 
     def upload_to_gcs(self, local_path: str) -> str:
         logger.info(f"Preparing to upload file from {local_path}")
@@ -113,6 +160,20 @@ class InstagramTranscriber:
         return f"gs://{self.bucket_name}/{blob_name}"
 
     def transcribe(self, url: str, temp_dir: Optional[str] = None) -> Dict:
+        """
+        Transcribe an Instagram video/reel.
+
+        Args:
+            url (str): The Instagram video/reel URL to transcribe
+            temp_dir (Optional[str]): Directory for temporary files. Defaults to /tmp
+
+        Returns:
+            Dict: Contains transcript text, title, author, and source URL
+
+        Raises:
+            ValueError: If GCP_STORAGE_BUCKET environment variable is not set
+            FileNotFoundError: If downloaded audio file cannot be found
+        """
         logger.info(f"Starting transcription for URL: {url}")
 
         if not self.bucket_name:
@@ -122,14 +183,31 @@ class InstagramTranscriber:
         logger.info(f"Video info: {info}")
 
         temp_dir = temp_dir or '/tmp'
-        temp_file = os.path.join(temp_dir, 'temp_audio')  # yt-dlp will add the extension
+        base_temp_file = os.path.join(temp_dir, 'temp_audio')  # Base filename without extension
 
         try:
             logger.info(f"Attempting to download video from {url}")
-            self.download_video(url, temp_file)
-            logger.info(f"Video downloaded to {temp_file}")
+            self.download_video(url, base_temp_file)
+            logger.info(f"Video downloaded to {base_temp_file}")
+
+            # Look for the actual file with extension
+            actual_file = None
+            for ext in ['.mp3', '.m4a', '.wav']:  # Common audio extensions
+                potential_file = base_temp_file + ext
+                if os.path.exists(potential_file):
+                    actual_file = potential_file
+                    logger.info(f"Found audio file: {potential_file}")
+                    break
+
+            if not actual_file:
+                logger.error(f"No audio file found in {temp_dir}")
+                logger.info(f"Directory contents: {os.listdir(temp_dir)}")
+                raise FileNotFoundError(f"No audio file found with base name {base_temp_file}")
+
+            logger.info(f"Found audio file: {actual_file}")
+
             logger.info("Uploading to GCS")
-            gcs_uri = self.upload_to_gcs(temp_file)
+            gcs_uri = self.upload_to_gcs(actual_file)
             logger.info(f"Uploaded to GCS: {gcs_uri}")
 
             # Configure the transcription request
@@ -145,7 +223,9 @@ class InstagramTranscriber:
 
             # Start long-running transcription
             operation = self.speech_client.long_running_recognize(config=config, audio=audio)
+            logger.info("Waiting for transcription to complete...")
             response = operation.result()
+            logger.info("Transcription completed")
 
             # Combine all transcriptions
             transcript_text = " ".join(
@@ -154,9 +234,11 @@ class InstagramTranscriber:
             )
 
             # Clean up GCS
+            logger.info("Cleaning up GCS bucket")
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob(gcs_uri.replace(f"gs://{self.bucket_name}/", ""))
             blob.delete()
+            logger.info("GCS cleanup completed")
 
             return {
                 'transcript': f"{str(transcript_text)}\n\nSource: {url}",
@@ -164,13 +246,22 @@ class InstagramTranscriber:
                 'author': f"{str(info.get('uploader', ''))} ({str(info.get('channel', ''))})",
                 'source_url': url
             }
+
+        except Exception as e:
+            logger.error(f"Error in transcribe: {str(e)}", exc_info=True)
+            raise
+
         finally:
-            # Clean up both potential files
-            for ext in ['.mp3', '.mp4', '']:
-                file_path = temp_file + ext
+            # Clean up temporary files
+            logger.info("Cleaning up temporary files")
+            for ext in ['.mp3', '.m4a', '.wav', '']:
+                file_path = base_temp_file + ext
                 if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up {file_path}")
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up {file_path}: {str(e)}")
 
 
 # ReadwiseUploader class remains unchanged

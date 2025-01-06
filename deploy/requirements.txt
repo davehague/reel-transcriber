@@ -1,6 +1,6 @@
 functions-framework==3.*
 flask==2.*
-yt-dlp==2023.11.16
+yt-dlp>=2023.11.16
 requests
 python-dotenv
 google-cloud-speech

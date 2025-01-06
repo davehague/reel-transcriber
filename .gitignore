@@ -93,6 +93,7 @@ celerybeat.pid
 
 # Environments
 .env
+deploy/.env.yaml
 .venv/
 env/
 venv/
