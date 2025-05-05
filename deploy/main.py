@@ -4,18 +4,46 @@ import yt_dlp
 import requests
 import os
 import json
+import traceback
 from datetime import datetime, timezone
 from typing import Dict, Optional
 import logging
+import sys
 from google.cloud import speech_v1
 from google.cloud import storage
 import uuid
 import time
 from openai import OpenAI
 
+# Configure structured logging
+class StructuredFormatter(logging.Formatter):
+    def format(self, record):
+        # Create a structured log record
+        log_entry = {
+            'timestamp': self.formatTime(record),
+            'level': record.levelname,
+            'message': record.getMessage(),
+            'module': record.module,
+            'function': record.funcName,
+            'lineno': record.lineno,
+        }
+        
+        # Add exception info if present
+        if record.exc_info:
+            # Get formatted exception info as a single string
+            exc_text = self.formatException(record.exc_info)
+            log_entry['exception'] = exc_text
+        
+        # Return as a single JSON string
+        return json.dumps(log_entry)
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(StructuredFormatter())
+logger = logging.getLogger('reel_transcriber')
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False  # Prevent duplicate logs
 
 
 class YDLLogger:
@@ -60,29 +88,48 @@ class InstagramTranscriber:
         url = self.normalize_instagram_url(url)
         logger.info(f"Normalized URL: {url}")
 
-        cookies = self.get_instagram_cookies()
+        try:
+            logger.info("Attempting to get Instagram cookies")
+            cookies = self.get_instagram_cookies()
+            logger.info(f"Retrieved cookies with keys: {list(cookies.keys())}")
 
-        ydl_opts = {
-            'skip_download': True,
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-            'encoding': None,
-            'logger': YDLLogger(),
-            'cookiefile': None,
-            'cookiesfrombrowser': None,
-            'cookies': cookies  # Use the cookies directly
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            # Ensure all string values are properly decoded
-            if isinstance(info.get('description'), bytes):
-                info['description'] = info['description'].decode('utf-8')
-            if isinstance(info.get('uploader'), bytes):
-                info['uploader'] = info['uploader'].decode('utf-8')
-            if isinstance(info.get('channel'), bytes):
-                info['channel'] = info['channel'].decode('utf-8')
-        return info
+            ydl_opts = {
+                'skip_download': True,
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,
+                'encoding': None,
+                'logger': YDLLogger(),
+                'cookiefile': None,
+                'cookiesfrombrowser': None,
+                'cookies': cookies  # Use the cookies directly
+            }
+            
+            logger.info("Starting yt-dlp extraction for video info")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info(f"Extracting info for URL: {url}")
+                info = ydl.extract_info(url, download=False)
+                logger.info("Successfully extracted video info")
+                
+                # Ensure all string values are properly decoded
+                if isinstance(info.get('description'), bytes):
+                    info['description'] = info['description'].decode('utf-8')
+                if isinstance(info.get('uploader'), bytes):
+                    info['uploader'] = info['uploader'].decode('utf-8')
+                if isinstance(info.get('channel'), bytes):
+                    info['channel'] = info['channel'].decode('utf-8')
+                    
+                # Log key video attributes for debugging
+                logger.info(f"Video info retrieved - title: {info.get('title', 'N/A')[:30]}..., "
+                           f"uploader: {info.get('uploader', 'N/A')}, "
+                           f"duration: {info.get('duration', 'N/A')}")
+                           
+            return info
+            
+        except Exception as e:
+            error_msg = f"Error in get_video_info for URL {url}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            raise
 
     def download_video(self, url: str, output_path: str) -> None:
         url = self.normalize_instagram_url(url)
@@ -115,38 +162,84 @@ class InstagramTranscriber:
                 # List directory contents after download
                 dir_path = os.path.dirname(output_path)
                 logger.info(f"Directory contents after download: {os.listdir(dir_path)}")
+        except yt_dlp.utils.DownloadError as e:
+            # Log detailed information for DownloadError
+            error_msg = f"yt-dlp download error for URL {url}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            
+            # Add diagnostic information
+            logger.error(f"Instagram credentials: Username={self.instagram_username}, Password={'*' * (len(self.instagram_password or '') if self.instagram_password else 0)}")
+            raise
         except Exception as e:
-            logger.error(f"Error during download: {str(e)}", exc_info=True)
+            error_msg = f"Error during download: {str(e)}"
+            logger.error(error_msg, exc_info=True)
             raise
 
     def get_instagram_cookies(self) -> Dict:
         """Get cookies needed for Instagram authentication."""
-        session = requests.Session()
-        # First request to get the csrftoken
-        session.get('https://www.instagram.com/accounts/login/')
-        cookies = session.cookies.get_dict()
+        try:
+            logger.info("Starting Instagram authentication process")
+            session = requests.Session()
+            
+            # First request to get the csrftoken
+            logger.info("Making initial request to Instagram to get csrftoken")
+            initial_response = session.get('https://www.instagram.com/accounts/login/')
+            logger.info(f"Initial request status code: {initial_response.status_code}")
+            
+            cookies = session.cookies.get_dict()
+            logger.info(f"Got initial cookies: {list(cookies.keys())}")
 
-        # Login request
-        login_data = {
-            'username': self.instagram_username,
-            'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{self.instagram_password}',
-            'queryParams': {},
-            'optIntoOneTap': 'false'
-        }
+            # Login request
+            login_data = {
+                'username': self.instagram_username,
+                'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{self.instagram_password}',
+                'queryParams': {},
+                'optIntoOneTap': 'false'
+            }
 
-        login_headers = {
-            'X-CSRFToken': cookies.get('csrftoken', ''),
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://www.instagram.com/accounts/login/'
-        }
-
-        session.post(
-            'https://www.instagram.com/accounts/login/ajax/',
-            data=login_data,
-            headers=login_headers
-        )
-
-        return session.cookies.get_dict()
+            login_headers = {
+                'X-CSRFToken': cookies.get('csrftoken', ''),
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://www.instagram.com/accounts/login/'
+            }
+            
+            logger.info("Sending login request to Instagram")
+            login_response = session.post(
+                'https://www.instagram.com/accounts/login/ajax/',
+                data=login_data,
+                headers=login_headers
+            )
+            
+            logger.info(f"Login response status code: {login_response.status_code}")
+            
+            # Try to get response JSON for debugging
+            try:
+                response_json = login_response.json()
+                # Don't log the full response as it might contain sensitive info
+                logger.info(f"Login response contains fields: {list(response_json.keys()) if isinstance(response_json, dict) else 'Not a dict'}")
+                
+                # Log authentication success/failure
+                if isinstance(response_json, dict):
+                    if response_json.get('authenticated', False):
+                        logger.info("Instagram authentication successful")
+                    else:
+                        logger.warning(f"Instagram authentication failed: {response_json.get('message', 'Unknown reason')}")
+            except Exception as json_error:
+                logger.warning(f"Could not parse login response as JSON: {str(json_error)}")
+            
+            final_cookies = session.cookies.get_dict()
+            logger.info(f"Final cookies: {list(final_cookies.keys())}")
+            
+            # Check for critical cookies
+            if 'sessionid' not in final_cookies:
+                logger.warning("Session ID cookie not found in response, authentication may have failed")
+                
+            return final_cookies
+        except Exception as e:
+            error_msg = f"Error during Instagram authentication: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            # Return empty dict as fallback
+            return {}
 
     def upload_to_gcs(self, local_path: str) -> str:
         logger.info(f"Preparing to upload file from {local_path}")
@@ -274,7 +367,8 @@ class InstagramTranscriber:
             }
 
         except Exception as e:
-            logger.error(f"Error in transcribe: {str(e)}", exc_info=True)
+            error_msg = f"Error in transcribe: {str(e)}"
+            logger.error(error_msg, exc_info=True)
             raise
 
         finally:
@@ -349,7 +443,9 @@ def transcribe_reel(request):
     try:
         logger.info("Starting transcribe_reel function")
         request_json = request.get_json()
-        logger.info(f"Received request: {request_json}")
+        # Log request data without sensitive information
+        safe_request = {k: v for k, v in request_json.items() if k not in ['readwise_token']}
+        logger.info(f"Received request: {json.dumps(safe_request)}")
 
         if not request_json or 'url' not in request_json:
             logger.error("No URL provided in request")
@@ -435,7 +531,9 @@ def transcribe_reel(request):
                     except Exception as callback_error:
                         logger.error(f"Exception during callback request: {callback_error}", exc_info=True)
                 except Exception as e:
-                    logger.error(f"Error in background processing: {str(e)}", exc_info=True)
+                    # Log the full exception with traceback as a single record
+                    error_msg = f"Error in background processing: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
             
             # Start processing in background
             import threading
@@ -465,5 +563,6 @@ def transcribe_reel(request):
             return jsonify(result), 200, headers
 
     except Exception as e:
-        logger.error(f"Error in transcribe_reel: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500, headers
+        error_msg = f"Error in transcribe_reel: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return jsonify({'error': str(e), 'type': type(e).__name__}), 500, headers
