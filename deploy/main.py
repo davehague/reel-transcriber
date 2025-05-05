@@ -3,6 +3,7 @@ from flask import jsonify
 import yt_dlp
 import requests
 import os
+import json
 from datetime import datetime, timezone
 from typing import Dict, Optional
 import logging
@@ -355,22 +356,113 @@ def transcribe_reel(request):
             return jsonify({'error': 'No URL provided'}), 400, headers
 
         url = request_json['url']
+        user_id = request_json.get('userId')
+        callback_url = request_json.get('callbackUrl')
         upload_to_readwise = request_json.get('upload_to_readwise', False)
         readwise_token = request_json.get('readwise_token')
         use_whisper = request_json.get('use_whisper', True)  # Default to Whisper
 
-        transcriber = InstagramTranscriber()
-        result = transcriber.transcribe(url, '/tmp', use_whisper=use_whisper)
+        # Verify needed parameters if we're using the callback approach
+        if callback_url and not user_id:
+            logger.error("userId is required when using callback")
+            return jsonify({'error': 'userId is required when using callback'}), 400, headers
 
-        if upload_to_readwise:
-            if not readwise_token:
-                return jsonify({'error': 'Readwise token required for upload'}), 400, headers
+        # If callback provided, process asynchronously
+        if callback_url:
+            logger.info(f"Processing asynchronously with callback URL: {callback_url}")
 
-            uploader = ReadwiseUploader(readwise_token)
-            upload_result = uploader.upload_transcript(result)
-            result['readwise_upload'] = upload_result
+            # Define the background processing function
+            def process_transcription():
+                try:
+                    logger.info(f"Background processing started for URL: {url}")
+                    # Initialize transcriber
+                    transcriber = InstagramTranscriber()
+                    
+                    # Get transcript and metadata
+                    result = transcriber.transcribe(url, '/tmp', use_whisper=use_whisper)
+                    logger.info("Transcription completed, preparing to send callback")
+                    
+                    # Upload to Readwise if requested
+                    if upload_to_readwise and readwise_token:
+                        uploader = ReadwiseUploader(readwise_token)
+                        upload_result = uploader.upload_transcript(result)
+                        result['readwise_upload'] = upload_result
+                    
+                    # Call back to the app with results
+                    logger.info(f"Sending callback to: {callback_url}")
+                    
+                    # Log the callback data
+                    callback_data = {
+                        'userId': user_id,
+                        'result': result
+                    }
+                    # Safely log the callback data without overwhelming the logs
+                    try:
+                        # Create a sanitized version for logging (just basic info)
+                        log_data = {
+                            'userId': user_id,
+                            'result': {
+                                'title': result.get('title', '')[:50],
+                                'author': result.get('author', '')[:50],
+                                'transcript_length': len(result.get('transcript', '')),
+                                'source_url': result.get('source_url', '')
+                            }
+                        }
+                        logger.info(f"Callback data summary: {json.dumps(log_data)}")
+                    except Exception as log_error:
+                        logger.error(f"Error logging callback data: {log_error}")
+                    
+                    # Make the callback request
+                    try:
+                        callback_response = requests.post(
+                            callback_url,
+                            json=callback_data,
+                            headers={'Content-Type': 'application/json'},
+                            timeout=30  # Add a timeout
+                        )
+                        logger.info(f"Callback response status: {callback_response.status_code}")
+                        logger.info(f"Callback response headers: {callback_response.headers}")
+                        
+                        # Log response content
+                        try:
+                            response_text = callback_response.text
+                            logger.info(f"Callback response body: {response_text[:500]}{'...' if len(response_text) > 500 else ''}")
+                        except Exception as text_error:
+                            logger.error(f"Error reading callback response text: {text_error}")
+                        
+                        if not callback_response.ok:
+                            logger.error(f"Callback failed with status code: {callback_response.status_code}")
+                    except Exception as callback_error:
+                        logger.error(f"Exception during callback request: {callback_error}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Error in background processing: {str(e)}", exc_info=True)
+            
+            # Start processing in background
+            import threading
+            threading.Thread(target=process_transcription).start()
+            logger.info("Background processing thread started")
+            
+            # Return immediate success response
+            return jsonify({
+                'success': True,
+                'message': 'Transcription started successfully'
+            }), 200, headers
+        
+        # Otherwise, process synchronously as before
+        else:
+            logger.info("Processing synchronously")
+            transcriber = InstagramTranscriber()
+            result = transcriber.transcribe(url, '/tmp', use_whisper=use_whisper)
 
-        return jsonify(result), 200, headers
+            if upload_to_readwise:
+                if not readwise_token:
+                    return jsonify({'error': 'Readwise token required for upload'}), 400, headers
+
+                uploader = ReadwiseUploader(readwise_token)
+                upload_result = uploader.upload_transcript(result)
+                result['readwise_upload'] = upload_result
+
+            return jsonify(result), 200, headers
 
     except Exception as e:
         logger.error(f"Error in transcribe_reel: {str(e)}", exc_info=True)
